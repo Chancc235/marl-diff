@@ -10,24 +10,24 @@ constants:
   q_weight: 1.0  # Weight for Q-learning loss
   policy_weight: 0.5  # Weight for policy optimization loss
   diversity_weight: 1.0
-  q_lr: 0.000001
-  q_pattern_lr: 0.00001
+  q_lr: 0.0001
+  q_pattern_lr: 0.0001
   q_pretrain_steps: 2000
-  learning_rate: 0.0002
+  learning_rate: 0.00005
 
   # VAE 预训练参数
   vae_pretrain_steps: 1000
   vae_learning_rate: 0.001
 
-  n_steps_per_epoch: 2000 
-  n_train_steps: 40000
+  n_steps_per_epoch: 3000
+  n_train_steps: 60000
   batch_size: 256 
   gradient_accumulate_every: 2
   ema_decay: 0.95
   update_ema_every: 1
 
   # misc
-  seed: 10021
+  seed: 10013
   job_name: "{dataset}/hh_{history_horizon}-bcw_{bc_weight}-qw_{q_weight}-pw_{policy_weight}-guidew_{condition_guidance_w}-lr_{learning_rate}-n_ddim_{n_ddim_steps}-{seed}"
   horizon: 1
   returns_scale: 380
@@ -42,34 +42,34 @@ constants:
   # model - use DiffusionBackbone for testing
   model: "models.DiffusionBackbone"
   diffusion: "models.CCDiffusion"
-  history_horizon: 30
-  n_diffusion_steps: 30
+  history_horizon: 50
+  n_diffusion_steps: 5
   use_ddim_sample: True
-  n_ddim_steps: 3
+  n_ddim_steps: 5
 
   returns_condition: True
   predict_epsilon: True
-  hidden_dim: 512
-  condition_dropout: 0.25
-  condition_guidance_w: 2.0
+  hidden_dim: 256
+  condition_dropout: 0.1
+  condition_guidance_w: 1.2
   clip_denoised: True
   renderer: "utils.MAMuJoCoRenderer"
 
-  trajectory_latent_dim: 128
-  pattern_latent_dim: 128
+  trajectory_latent_dim: 64
+  pattern_latent_dim: 64
   action_latent_dim: 16
-  pattern_num_layers: 4
-  pattern_dropout: 0.25
+  pattern_num_layers: 3
+  pattern_dropout: 0.2
   
   # DiffusionBackbone specific parameters
-  backbone_layers: 4
-  backbone_hidden_dim: 512
+  backbone_layers: 5
+  backbone_hidden_dim: 256
   
   # TrajectoryEncoder sequence model parameters
   trajectory_sequence_model: "transformer"  # Options: "transformer", "lstm", "gru"
-  trajectory_num_layers: 4
+  trajectory_num_layers: 3
   trajectory_num_heads: 4
-  trajectory_dropout: 0.25
+  trajectory_dropout: 0.2
   
   use_behavior_cloning: true
 
@@ -87,8 +87,8 @@ constants:
   include_env_ts: true
 
   # training
-  log_freq: 500
-  save_freq: 2000
+  log_freq: 1000
+  save_freq: 3000
   sample_freq: 0 
   n_saves: 2
   save_parallel: False
@@ -99,12 +99,14 @@ constants:
   evaluator: "utils.VAEDiffusionEvaluator"  # CHANGED: Use VAE-specific evaluator
   num_eval: 30
   num_envs: 10
-  eval_freq: 2000
+  eval_freq: 3000
   test_ret: 1.0
   vae_learning_rate: 0.001
 
   # Offline RL Trainer parameters
-  target_update_freq: 50
-  target_update_tau: 0.5
+  target_update_freq: 10
+  target_update_tau: 0.05
+  n_target_q_functions: 5
+  beta: 1.0
   # load checkpoint
   continue_training: false

@@ -21,11 +21,11 @@ class CCRLTrainer(Trainer):
         super().__init__(diffusion_model, dataset, renderer, **kwargs)
 
         self.target_update_freq = target_update_freq
-        
+        self.target_update_tau = kwargs.get('target_update_tau', 0.005)
         # Separate optimizers for different components
         if hasattr(self.model, 'q_function'):
             self.q_optimizer = torch.optim.Adam(
-                self.model.q_function.parameters(), 
+                [param for qf in self.model.q_function for param in qf.parameters()],
                 lr=self.q_lr
             )
             self.pattern_q_optimizer = torch.optim.Adam(
@@ -51,7 +51,11 @@ class CCRLTrainer(Trainer):
             if step_idx % 100 == 0:
                 logger.print(f"Q pretrain step {step_idx}/{n_train_steps}, Q loss: {q_loss.item():.4f}")
             if step_idx % self.target_update_freq == 0:
-                self.model.target_q_function.load_state_dict(self.model.q_function.state_dict())
+                tau = self.target_update_tau
+                for i, target_q_function in enumerate(self.model.target_q_functions):
+                    for param, target_param in zip(self.model.q_function[i].parameters(), target_q_function.parameters()):
+                        target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+
         logger.print("Q-function pretraining completed")
 
     def train(self, n_train_steps):
@@ -224,7 +228,7 @@ class CCRLTrainer(Trainer):
         import csv
         import os
         
-        # Calculate averages
+        # # Calculate averages
         avg_loss = np.mean(epoch_losses)
         avg_metrics = {}
         for key, values in epoch_metrics.items():
@@ -233,7 +237,6 @@ class CCRLTrainer(Trainer):
         # Create CSV data
         csv_data = {
             'epoch': self.step // n_train_steps,
-            'avg_loss': avg_loss,
             **avg_metrics
         }
         

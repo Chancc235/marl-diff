@@ -19,7 +19,7 @@ class PatternEncoder(nn.Module):
         latent_dim: int = 64,
         num_layers: int = 2,
         dropout: float = 0.1,
-        bidirectional: bool = True,
+        bidirectional: bool = False,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -187,8 +187,8 @@ class TrajectoryEncoder(nn.Module):
             # Transformer encoding
             encoded = self.sequence_encoder(x)  # [batch, seq_len, hidden_dim]
             
-            # Global average pooling over sequence dimension
-            pooled = encoded.mean(dim=1)  # [batch, hidden_dim]
+            # Use the last token (最后一个token)
+            pooled = encoded[:, -1, :]  # [batch, hidden_dim]
             
         elif self.sequence_model in ["lstm", "gru"]:
             # RNN encoding

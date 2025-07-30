@@ -71,6 +71,7 @@ class CCDiffusion(nn.Module):
         self.n_ddim_steps = kwargs.get('n_ddim_steps', 15)
         self.target_update_freq = kwargs.get('target_update_freq', 10)
         self.target_update_tau = kwargs.get('target_update_tau', 0.5)
+        self.n_target_q_functions = kwargs.get('n_target_q_functions', 2)
         self.action_latent_dim = action_latent_dim
         # Offline RL parameters
 
@@ -125,27 +126,37 @@ class CCDiffusion(nn.Module):
         pattern_q_input_dim = observation_dim * n_agents + pattern_latent_dim * n_agents + trajectory_latent_dim * n_agents
         
         # # Value function for offline RL (Q-function)
-        self.q_function = nn.Sequential(
-            nn.Linear(q_input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, 1),
-        )
+        # 将 q_function 也改成列表，便于实现 ensemble 或 double Q-learning
+        self.q_function = [
+            nn.Sequential(
+                nn.Linear(q_input_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.Mish(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.Mish(),
+                nn.Linear(hidden_dim, 1),
+            )
+            for _ in range(self.n_target_q_functions)
+        ]
         # Target Q-function for stable training
-        self.target_q_function = nn.Sequential(
-            nn.Linear(q_input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, 1),
-        )
+        # 将 target_q_function 写成列表，便于实现 ensemble 或 double Q-learning
+        self.target_q_functions = [
+            nn.Sequential(
+                nn.Linear(q_input_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.Mish(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.Mish(),
+                nn.Linear(hidden_dim, 1),
+            )
+            for _ in range(self.n_target_q_functions)
+        ]
         # # Initialize target network
-        self.target_q_function.load_state_dict(self.q_function.state_dict())
+        for i, target_q_function in enumerate(self.target_q_functions):
+            target_q_function.load_state_dict(self.q_function[i].state_dict())
+        
         self.pattern_q_function = nn.Sequential(
             nn.Linear(pattern_q_input_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
@@ -160,7 +171,7 @@ class CCDiffusion(nn.Module):
         self.n_timesteps = int(n_timesteps)
         self.clip_denoised = clip_denoised
         self.predict_epsilon = predict_epsilon
-        
+        self.beta = kwargs.get('beta', 0.1)
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=self.n_timesteps,
             clip_sample=True,
@@ -173,8 +184,25 @@ class CCDiffusion(nn.Module):
             
         # Loss functions
         self.data_encoder = data_encoder
+        
+        # Ensure all Q functions are on the same device as the main model
+        self._move_q_functions_to_device()
 
     
+    def _move_q_functions_to_device(self):
+        """Move all Q functions to the same device as the main model"""
+        if hasattr(self, 'model') and self.model is not None:
+            # Get device from the main model
+            device = next(self.model.parameters()).device
+            for i in range(self.n_target_q_functions):
+                self.q_function[i] = self.q_function[i].to(device)
+                self.target_q_functions[i] = self.target_q_functions[i].to(device)
+            self.pattern_q_function = self.pattern_q_function.to(device)
+            
+            # Also move trajectory encoder if it exists
+            if hasattr(self, 'trajectory_encoder'):
+                self.trajectory_encoder = self.trajectory_encoder.to(device)
+
     def encode_trajectory(self, trajectory, agent_idx=None):
         return self.trajectory_encoder(trajectory, agent_idx=agent_idx)
 
@@ -188,7 +216,6 @@ class CCDiffusion(nn.Module):
         attention_masks: Optional[torch.Tensor] = None,
         use_dropout: bool = True,
         force_dropout: bool = False,
-        agent_idx: Optional[int] = None,  # New parameter for decentralized mode
     ):
         """Get diffusion model output"""
         
@@ -199,12 +226,10 @@ class CCDiffusion(nn.Module):
             epsilon_cond = self.model(
                 model_input, t, returns=returns, env_timestep=env_timestep,
                 attention_masks=attention_masks, use_dropout=False,
-                agent_idx=agent_idx,  # Pass agent_idx for decentralized mode
             )
             epsilon_uncond = self.model(
                 model_input, t, returns=returns, env_timestep=env_timestep,
                 attention_masks=attention_masks, force_dropout=True,
-                agent_idx=agent_idx,  # Pass agent_idx for decentralized mode
             )
             epsilon = epsilon_uncond + self.condition_guidance_w * (
                 epsilon_cond - epsilon_uncond
@@ -214,7 +239,6 @@ class CCDiffusion(nn.Module):
                 model_input, t, env_timestep=env_timestep,
                 attention_masks=attention_masks, use_dropout=use_dropout,
                 force_dropout=force_dropout,
-                agent_idx=agent_idx,  # Pass agent_idx for decentralized mode
             )
         
         return epsilon
@@ -267,7 +291,7 @@ class CCDiffusion(nn.Module):
             for t in timesteps:
                 ts = torch.full((batch_size,), t, device=device, dtype=torch.long)
                 model_output = self.get_model_output(
-                    x, ts, trajectory_condition, returns, env_ts, attention_masks, agent_idx=agent_idx
+                    x, ts, trajectory_condition, returns, env_ts, attention_masks
                 )
                 
                 x = scheduler.step(model_output, t, x).prev_sample
@@ -394,18 +418,12 @@ class CCDiffusion(nn.Module):
 
         # Compute current Q-values
         q_input = torch.cat([obs_flat, actions_flat, trajectory_conditions], dim=-1)
-        q_current = self.q_function(q_input)
+        q_current = [self.q_function[i](q_input) for i in range(self.n_target_q_functions)]
         
         # Compute target Q-values with improved target policy
         with torch.no_grad():
             # Create updated trajectory for next state
-            if hasattr(self, 'discrete_action') and self.discrete_action and actions_last.shape[-1] == 1:
-                action_indices = actions_last.squeeze(-1).long()
-                action_indices = torch.clamp(action_indices, 0, self.action_dim - 1)
-                actions_onehot = F.one_hot(action_indices, num_classes=self.action_dim).float()
-                current_step = torch.cat([obs_last, actions_onehot], dim=-1)  # [batch, n_agents, obs_dim + action_dim]
-            else:
-                current_step = torch.cat([obs_last, actions_last], dim=-1)  # [batch, n_agents, obs_dim + action_dim]
+            current_step = torch.cat([obs_last, actions_last], dim=-1)  # [batch, n_agents, obs_dim + action_dim]
             current_step = current_step.unsqueeze(1)  # [batch, 1, n_agents, obs_dim + action_dim]
             
             # Update trajectory by appending current step and removing oldest if needed
@@ -425,15 +443,18 @@ class CCDiffusion(nn.Module):
             
             next_trajectory_condition = torch.stack(next_conditions_list, dim=1).view(batch_size, -1)
             next_q_input = torch.cat([next_obs_flat, actions_next_flat, next_trajectory_condition], dim=1)
-            next_q = self.target_q_function(next_q_input).detach()
-            
+            next_q = [self.target_q_functions[i](next_q_input).detach() for i in range(self.n_target_q_functions)]
+            q_nexts = torch.stack(next_q, dim=0)  # [ensemble_size, batch_size]
+            q_mean = q_nexts.mean(dim=0)
+            q_std = q_nexts.std(dim=0)
+            lcb = q_mean - self.beta * q_std
             # Process rewards and dones
             reward_scalar = rewards_last.view(batch_size, -1).mean(dim=-1, keepdim=True)  # (batch_size, 1)
             done_scalar = dones_last.view(batch_size, -1).any(dim=-1, keepdim=True)       # (batch_size, 1)
-            
-            target_q = reward_scalar + self.discount * next_q * (1 - done_scalar.float())
+            target_q = reward_scalar + self.discount * lcb * (1 - done_scalar.float())
         
-        q_loss = F.mse_loss(q_current, target_q)
+        q_loss = [F.mse_loss(q_current[i], target_q) for i in range(self.n_target_q_functions)]
+        q_loss = sum(q_loss) / self.n_target_q_functions
         return q_loss
 
     def pattern_q_learning_loss(self, obs, rewards, dones, history_trajectory):
@@ -458,7 +479,9 @@ class CCDiffusion(nn.Module):
         pattern_q_input = torch.cat([obs_flat, pattern_latents_flat, trajectory_conditions], dim=-1)
 
         q_current = self.pattern_q_function(pattern_q_input)
-        q_label = self.q_function(q_input).detach()
+        q_label = [self.q_function[i](q_input).detach() for i in range(self.n_target_q_functions)]
+        q_label = torch.stack(q_label, dim=0)
+        q_label = q_label.mean(dim=0) - self.beta * q_label.std(dim=0)
         q_loss = F.mse_loss(q_current, q_label)
         return q_loss
         
@@ -480,31 +503,9 @@ class CCDiffusion(nn.Module):
             agent_actions, pattern_latents, trajectory_conditions = self.conditional_sample(
                 cond, return_diffusion=True, enable_grad=True
             )
-            if self.discrete_action:
-                agent_actions = F.softmax(agent_actions, dim=-1)
+
             policy_actions = agent_actions
             policy_actions_latents = pattern_latents
-            
-            # Get action indices from the true actions
-            if self.discrete_action:
-                if actions.shape[-1] == 1:
-                    # Actions are already indices
-                    action_indices = actions.squeeze(-1).long()  # [batch, n_agents]
-                else:
-                    # Actions are one-hot, convert to indices
-                    action_indices = actions.argmax(dim=-1)  # [batch, n_agents]
-            else:
-                # For continuous actions, we'll use a different approach
-                action_indices = None
-
-            
-            if self.discrete_action and action_indices is not None:
-                # Extract the probability values for the actual actions using proper indexing
-                batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, self.n_agents)
-                agent_indices = torch.arange(self.n_agents, device=device).unsqueeze(0).expand(batch_size, -1)
-                
-                action_probs = policy_actions[batch_indices, agent_indices, action_indices]  # [batch, n_agents]
-                log_action_probs = torch.log(action_probs + 1e-8)  # Add small epsilon to avoid log(0)
 
             # Flatten for Q-function input  
             obs_flat = obs.view(batch_size, -1)
@@ -517,14 +518,7 @@ class CCDiffusion(nn.Module):
             # Use clipped Q-values for more stable training
             pattern_q_value = torch.clamp(pattern_q_value, -10, 10)
             
-            if self.discrete_action:
-                # Use advantage-based weighting for more stable training
-                advantage = pattern_q_value.expand_as(log_action_probs)
-                # Clip advantage to prevent extreme values
-                advantage = torch.clamp(advantage, -5, 5)
-                policy_loss = -(advantage * log_action_probs).mean()
-            else:
-                policy_loss = -pattern_q_value.mean() + 1e-8
+            policy_loss = -pattern_q_value.mean() + 1e-8
 
         return policy_loss
 
@@ -549,15 +543,8 @@ class CCDiffusion(nn.Module):
         
         batch_size = len(x)
         actions = actions[:, -1, :, :].squeeze(1)  # [batch, n_agents, action_dim]
-        if self.discrete_action:
-            # Convert discrete actions to one-hot encoding
-            if actions.shape[-1] == 1:
-                # Actions are indices, convert to one-hot
-                action_indices = actions.squeeze(-1).long()  # [batch, n_agents]
-                action_indices = torch.clamp(action_indices, 0, self.action_dim - 1)
-                actions = F.one_hot(action_indices, num_classes=self.action_dim).float()  # [batch, n_agents, action_dim]
         observations = observations[:, -1, :, :].squeeze(1)  # [batch, n_agents, obs_dim]
-        # Encode historical trajectory for conditioning
+        # Encode historical trajectory fosr conditioning
         trajectory_conditions = []
         for agent_idx in range(self.n_agents):
             trajectory_condition = self.encode_trajectory(history_trajectory, agent_idx=agent_idx)
@@ -570,14 +557,15 @@ class CCDiffusion(nn.Module):
             (batch_size,), device=x.device,
         ).long()
 
-        diffusion_loss, info = self.p_losses(
-            actions, trajectory_condition, t,
-            returns, env_ts, attention_masks,
-        )
+        # diffusion_loss, info = self.p_losses(
+        #     actions, trajectory_condition, t,
+        #     returns, env_ts, attention_masks,
+        # )
 
-        # Initialize total loss
-        total_loss = diffusion_loss
-        
+        # # Initialize total loss
+        # total_loss = diffusion_loss
+        total_loss = torch.tensor(0.0, device=x.device)
+        info = {}
         if self.use_behavior_cloning:
             if self.discrete_action:
                 bc_loss = self.behavioral_cloning_loss(observations, action_indices, trajectory_condition)
@@ -585,16 +573,15 @@ class CCDiffusion(nn.Module):
                 bc_loss = self.behavioral_cloning_loss(observations, actions, trajectory_condition)
             total_loss += self.bc_weight * bc_loss
             info["bc_loss"] = bc_loss.item() if torch.is_tensor(bc_loss) else bc_loss
-        # vae_loss = self.compute_action_latent_loss(actions)
-        # total_loss += self.vae_weight * vae_loss
-        # info["vae_loss"] = vae_loss.item() if torch.is_tensor(vae_loss) else vae_loss
+
         
         return total_loss, info
     
     def update_target_network(self, tau: float = 0.005):
         """Soft update of target Q-network"""
-        for target_param, param in zip(self.target_q_function.parameters(), self.q_function.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+        for i in range(self.n_target_q_functions):
+            for target_param, param in zip(self.target_q_functions[i].parameters(), self.q_function[i].parameters()):
+                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
     
     def get_action(self, obs, history_trajectory=None, deterministic=False, agent_idx=None, returns=None):
         """Get action from current policy
@@ -706,5 +693,24 @@ class CCDiffusion(nn.Module):
         
         # Combine info
         info = {**pattern_q_info, **policy_info}
-        
+        info = {}
+        pattern_q_loss_weighted = torch.tensor(0.0, device=x.device)
+        policy_loss_weighted = torch.tensor(0.0, device=x.device)
         return pattern_q_loss_weighted, policy_loss_weighted, info
+
+    def to(self, device):
+        """Move model to device and ensure all Q functions are also moved"""
+        # Call parent class to method first
+        super().to(device)
+        
+        # Move all Q functions to the same device
+        for i in range(self.n_target_q_functions):
+            self.q_function[i] = self.q_function[i].to(device)
+            self.target_q_functions[i] = self.target_q_functions[i].to(device)
+        self.pattern_q_function = self.pattern_q_function.to(device)
+        
+        # Also move trajectory encoder if it exists
+        if hasattr(self, 'trajectory_encoder'):
+            self.trajectory_encoder = self.trajectory_encoder.to(device)
+            
+        return self

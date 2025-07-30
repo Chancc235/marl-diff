@@ -145,7 +145,8 @@ class Trainer(object):
         if self.step < self.step_start_ema:
             self.reset_parameters()
             return
-        self.ema.update_model_average(self.ema_model, self.model)
+        # self.ema.update_model_average(self.ema_model, self.model)
+        self.ema_model.load_state_dict(self.model.state_dict())
 
     # -----------------------------------------------------------------------------#
     # ------------------------------------ api ------------------------------------#

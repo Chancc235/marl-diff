@@ -1,1 +1,1 @@
-nohup python run_experiment.py -e exp_specs/smac/3m/dc_smac_3m_good.yaml -g 4 > run_4.log 2>&1 &
+nohup python run_experiment.py -e exp_specs/mamujoco/2ant/cc_mamujoco_2ant.yaml -g 4 > run_4.log 2>&1 &
