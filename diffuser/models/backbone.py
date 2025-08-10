@@ -4,10 +4,9 @@ import torch.nn.functional as F
 from torch import nn
 from typing import Dict, Optional, Tuple
 import numpy as np
-
 import diffuser.utils as utils
 from diffuser.models.helpers import Losses, apply_conditioning
-from diffuser.models.temporal import SinusoidalPosEmb, TemporalMlpBlock
+import math
 
 class PatternEncoder(nn.Module):
     """LSTM-based sequence model for encoding action patterns"""
@@ -148,16 +147,20 @@ class TrajectoryEncoder(nn.Module):
         # Output projection to latent dimension
         self.output_proj = nn.Sequential(
             nn.Linear(sequence_output_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, latent_dim)
         )
         
-        # Positional encoding for transformer
+        # Positional encoding for transformer (use fixed sinusoidal encoding)
         if sequence_model == "transformer":
-            self.pos_encoding = nn.Parameter(
-                torch.randn(1, history_horizon, hidden_dim) * 0.02
-            )
+            position = torch.arange(history_horizon).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, hidden_dim, 2) * (-math.log(10000.0) / hidden_dim))
+            pe = torch.zeros(1, history_horizon, hidden_dim)
+            pe[0, :, 0::2] = torch.sin(position * div_term)
+            pe[0, :, 1::2] = torch.cos(position * div_term)
+            self.register_buffer('pos_encoding', pe)
         
     def forward(self, trajectory, agent_idx=None):
         """
@@ -179,16 +182,11 @@ class TrajectoryEncoder(nn.Module):
             seq_len = x.shape[1]
             if seq_len <= self.history_horizon:
                 x = x + self.pos_encoding[:, :seq_len, :]
-            else:
-                # Handle sequences longer than expected
-                pos_enc_extended = self.pos_encoding.repeat(1, (seq_len // self.history_horizon) + 1, 1)
-                x = x + pos_enc_extended[:, :seq_len, :]
             
             # Transformer encoding
             encoded = self.sequence_encoder(x)  # [batch, seq_len, hidden_dim]
             
-            # Use the last token (最后一个token)
-            pooled = encoded[:, -1, :]  # [batch, hidden_dim]
+            pooled = encoded.mean(dim=1)  # [batch, hidden_dim]
             
         elif self.sequence_model in ["lstm", "gru"]:
             # RNN encoding
@@ -236,41 +234,26 @@ class DiffusionBackbone(nn.Module):
         input_dim = action_dim + trajectory_latent_dim
         
         # Time embedding for each agent
-        self.time_mlp = nn.ModuleList([
-            nn.Sequential(
-                SinusoidalPosEmb(time_embed_dim // 4),
-                nn.Linear(time_embed_dim // 4, time_embed_dim),
-                nn.ReLU(),
-                nn.Linear(time_embed_dim, time_embed_dim),
-            ) for _ in range(n_agents)
-        ])
+        self.time_mlp = nn.Linear(1, time_embed_dim)
+
         
         # Returns conditioning for each agent
         if self.returns_condition:
-            self.returns_mlp = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(1, time_embed_dim // 2),
-                    nn.ReLU(),
-                    nn.Linear(time_embed_dim // 2, time_embed_dim),
-                ) for _ in range(n_agents)
-            ])
+            self.returns_mlp = nn.Linear(1, time_embed_dim)
             self.mask_dist = torch.distributions.Bernoulli(probs=0.1)
         
         # Input projection for each agent
-        self.input_proj = nn.ModuleList([
-            nn.Linear(input_dim, hidden_dim) for _ in range(n_agents)
-        ])
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
         
         # Independent processing layers for each agent
         self.agent_layers = nn.ModuleList([
             nn.ModuleList([
                 nn.ModuleDict({
-                    'mlp': TemporalMlpBlock(
-                        dim_in=hidden_dim,
-                        dim_out=hidden_dim,
-                        embed_dim=time_embed_dim,
-                        act_fn=nn.ReLU(),
-                        out_act_fn=nn.ReLU()
+                    'mlp': nn.Sequential(
+                        nn.Linear(hidden_dim + time_embed_dim, hidden_dim),
+                        nn.LeakyReLU(),
+                        nn.Linear(hidden_dim, hidden_dim),
+                        nn.LeakyReLU(),
                     ),
                     'layer_norm': nn.LayerNorm(hidden_dim),
                     'dropout': nn.Dropout(0.1)
@@ -279,9 +262,8 @@ class DiffusionBackbone(nn.Module):
         ])
         
         # Output projection for each agent
-        self.output_proj = nn.ModuleList([
-            nn.Linear(hidden_dim, action_dim) for _ in range(n_agents)
-        ])
+        self.output_proj = nn.Linear(hidden_dim, action_dim)
+
         
     def forward(
         self, 
@@ -310,39 +292,36 @@ class DiffusionBackbone(nn.Module):
         
         # Process each agent independently
         outputs = []
+
+        t_emb = self.time_mlp(t.unsqueeze(-1))  # [batch, time_embed_dim]
+        # Returns conditioning for this agent
+        if self.returns_condition:
+            if returns is not None and not force_dropout:
+                returns_scalar = returns.float().view(returns.shape[0], -1).mean(dim=-1, keepdim=True)  # [batch, 1]
+                
+                # Ensure returns_scalar is always [batch, 1]
+                if returns_scalar.shape[-1] != 1:
+                    returns_scalar = returns_scalar.mean(dim=-1, keepdim=True)
+                
+                # Compute returns embedding for this agent
+                returns_emb = self.returns_mlp(returns_scalar.float())
+                
+                # During training, randomly drop out returns with probability 0.1 for CFG
+                if self.training:
+                    mask = self.mask_dist.sample((batch_size,)).to(returns.device)
+                    # mask is 1 with prob 0.9 (keep returns), 0 with prob 0.1 (drop returns)
+                    returns_emb = returns_emb * mask.unsqueeze(-1)
+            else:
+                # Zero out returns embedding when force_dropout or returns is None
+                returns_emb = torch.zeros(batch_size, self.time_embed_dim, device=x.device)
+        
+            t_emb = t_emb + returns_emb
+
         for agent_idx in range(n_agents):
             # Extract agent-specific input
             agent_x = x[:, agent_idx:agent_idx+1, :]  # [batch, 1, input_dim]
-            
-            # Time embedding for this agent
-            t_emb = self.time_mlp[agent_idx](t)  # [batch, time_embed_dim]
-            
-            # Returns conditioning for this agent
-            if self.returns_condition:
-                if returns is not None and not force_dropout:
-                    returns_scalar = returns.float().view(returns.shape[0], -1).mean(dim=-1, keepdim=True)  # [batch, 1]
-                    
-                    # Ensure returns_scalar is always [batch, 1]
-                    if returns_scalar.shape[-1] != 1:
-                        returns_scalar = returns_scalar.mean(dim=-1, keepdim=True)
-                    
-                    # Compute returns embedding for this agent
-                    returns_emb = self.returns_mlp[agent_idx](returns_scalar.float())
-                    
-                    # During training, randomly drop out returns with probability 0.1 for CFG
-                    if self.training:
-                        mask = self.mask_dist.sample((batch_size,)).to(returns.device)
-                        # mask is 1 with prob 0.9 (keep returns), 0 with prob 0.1 (drop returns)
-                        returns_emb = returns_emb * mask.unsqueeze(-1)
-                else:
-                    # Zero out returns embedding when force_dropout or returns is None
-                    returns_emb = torch.zeros(batch_size, self.time_embed_dim, device=x.device)
-                
-                # Combine time and returns embeddings
-                t_emb = t_emb + returns_emb
-            
-            # Input projection for this agent
-            agent_x = self.input_proj[agent_idx](agent_x)  # [batch, 1, hidden_dim]
+
+            agent_x = self.input_proj(agent_x)  # [batch, 1, hidden_dim]
             
             # Expand time embedding for this agent
             t_emb_expanded = t_emb.unsqueeze(1)  # [batch, 1, time_embed_dim]
@@ -350,10 +329,10 @@ class DiffusionBackbone(nn.Module):
             # Apply independent processing layers for this agent
             for layer in self.agent_layers[agent_idx]:
                 # MLP processing with time embedding
-                agent_x = layer['layer_norm'](agent_x + layer['dropout'](layer['mlp'](agent_x, t_emb_expanded)))
+                agent_x = layer['layer_norm'](agent_x + layer['dropout'](layer['mlp'](torch.cat([agent_x, t_emb_expanded], dim=-1))))
             
             # Output projection for this agent
-            agent_output = self.output_proj[agent_idx](agent_x)  # [batch, 1, action_dim]
+            agent_output = self.output_proj(agent_x)  # [batch, 1, action_dim]
             outputs.append(agent_output)
         
         # Concatenate all agent outputs

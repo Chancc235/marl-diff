@@ -285,6 +285,9 @@ if __name__ == "__main__":
     parser.add_argument("-g", "--gpu", help="gpu id", type=str, default="0")
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    
+    # Add CUDA_LAUNCH_BLOCKING for better error reporting
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
     with open(args.experiment, "r") as spec_file:
         spec_string = spec_file.read()

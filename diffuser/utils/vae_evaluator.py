@@ -262,7 +262,7 @@ class VAEDiffusionEvaluator:
                     # Create minimal history using current observation and zero actions
                     minimal_history = np.zeros((max(history_horizon, 1), Config.n_agents, observation_dim + model_action_dim))
                     # Fill the last timestep with current observation and zero actions
-                    minimal_history[-1, :, :observation_dim] = obs_normalized
+                    minimal_history[-1, :, -observation_dim:] = obs_normalized
                     # Action part remains zero, which is reasonable for initialization
                     batch_history_trajectory.append(minimal_history)
             
@@ -280,7 +280,6 @@ class VAEDiffusionEvaluator:
             with torch.no_grad():
                 if hasattr(self.trainer.ema_model, 'get_action'):
                     batch_size = obs_tensor.shape[0]
-                    
                     # Handle returns conditioning
                     kwargs = {
                         'obs': obs_tensor[:, -1],  # Use latest observation [batch_size, n_agents, obs_dim]

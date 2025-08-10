@@ -43,11 +43,11 @@ constants:
   model: "models.DiffusionBackbone"
   diffusion: "models.CCDiffusion"
   history_horizon: 50
-  n_diffusion_steps: 5
-  use_ddim_sample: True
-  n_ddim_steps: 5
+  n_diffusion_steps: 3
+  use_ddim_sample: False
+  n_ddim_steps: 3
 
-  returns_condition: True
+  returns_condition: False
   predict_epsilon: True
   hidden_dim: 256
   condition_dropout: 0.1

@@ -10,7 +10,7 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 import diffuser.utils as utils
 from diffuser.models.helpers import Losses, apply_conditioning
 from diffuser.models.backbone import TrajectoryEncoder, PatternEncoder
-
+from diffuser.models.decision_transformer import DecisionTransformer
 
 class CCDiffusion(nn.Module):
     """Offline Diffusion-based RL with VAE for action generation"""
@@ -87,20 +87,29 @@ class CCDiffusion(nn.Module):
         # For trajectory encoding, always use the full action space dimension
         # even for discrete actions, since we'll handle the conversion inside
         # In training, we always pass full trajectory with all agents, so use centralized input_dim
-        self.trajectory_encoder = TrajectoryEncoder(
-            observation_dim=observation_dim,
-            action_dim=action_dim,  # Always use full action space
-            history_horizon=max(history_horizon, 1),
-            n_agents=n_agents,
-            hidden_dim=hidden_dim,
-            latent_dim=trajectory_latent_dim,
-            decentralized=False,  # Always use centralized mode for training
-            # Sequence model parameters
-            sequence_model=kwargs.get('trajectory_sequence_model', 'transformer'),
-            num_layers=kwargs.get('trajectory_num_layers', 2),
-            num_heads=kwargs.get('trajectory_num_heads', 8),
-            dropout=kwargs.get('trajectory_dropout', 0.1),
-        )
+        # self.trajectory_encoder = TrajectoryEncoder(
+        #     observation_dim=observation_dim,
+        #     action_dim=action_dim,  # Always use full action space
+        #     history_horizon=max(history_horizon, 1),
+        #     n_agents=n_agents,
+        #     hidden_dim=hidden_dim,
+        #     latent_dim=trajectory_latent_dim,
+        #     decentralized=False,  # Always use centralized mode for training
+        #     # Sequence model parameters
+        #     sequence_model=kwargs.get('trajectory_sequence_model', 'transformer'),
+        #     num_layers=kwargs.get('trajectory_num_layers', 2),
+        #     num_heads=kwargs.get('trajectory_num_heads', 8),
+        #     dropout=kwargs.get('trajectory_dropout', 0.1),
+        # )
+        self.trajectory_encoder = DecisionTransformer(state_dim=observation_dim, 
+                                                      act_dim=action_dim, 
+                                                      max_ep_len=max(history_horizon, 1),
+                                                      n_head=kwargs.get('trajectory_num_heads', 4),
+                                                      n_layer=kwargs.get('trajectory_num_layers', 2),
+                                                      dropout=kwargs.get('trajectory_dropout', 0.1),
+                                                      n_embd=trajectory_latent_dim,
+                                                      hidden_size=trajectory_latent_dim,
+                                                      )
         self.pattern_encoder = PatternEncoder(
             action_dim=action_dim,
             hidden_dim=hidden_dim,
@@ -203,8 +212,32 @@ class CCDiffusion(nn.Module):
             if hasattr(self, 'trajectory_encoder'):
                 self.trajectory_encoder = self.trajectory_encoder.to(device)
 
-    def encode_trajectory(self, trajectory, agent_idx=None):
-        return self.trajectory_encoder(trajectory, agent_idx=agent_idx)
+    def encode_trajectory(self, trajectory, agent_idx=None, test_obs=None):
+        # 按最后一维切分action和obs，并取agent_idx
+        action_dim = self.action_dim
+        obs_dim = self.observation_dim
+        # trajectory: [batch, history_horizon, n_agents, action_dim + obs_dim]
+        actions = trajectory[..., :action_dim]
+        obs = trajectory[..., action_dim:action_dim+obs_dim]
+        if agent_idx is not None:
+            actions = actions[:, :, agent_idx, :]
+            obs = obs[:, :, agent_idx, :]
+
+        # 若为测试状态，拼接一个新的obs和全0的action
+        if test_obs is not None:
+            # test_obs: [batch, obs_dim]
+            batch_size = obs.shape[0]
+            # 新的action全0
+            
+            new_action = torch.zeros((batch_size, 1, action_dim), dtype=actions.dtype, device=actions.device)
+            test_obs = test_obs[:, agent_idx, :]
+            new_obs = test_obs.unsqueeze(1) if test_obs.dim() == 2 else test_obs  # [batch, 1, obs_dim]
+            actions = torch.cat([actions, new_action], dim=1)
+            obs = torch.cat([obs, new_obs], dim=1)
+            obs = obs[:, 1:, :]
+            actions = actions[:, 1:, :]
+        x = self.trajectory_encoder.get_embeddings(obs, actions)
+        return x
 
     def get_model_output(
         self,
@@ -227,13 +260,14 @@ class CCDiffusion(nn.Module):
                 model_input, t, returns=returns, env_timestep=env_timestep,
                 attention_masks=attention_masks, use_dropout=False,
             )
-            epsilon_uncond = self.model(
-                model_input, t, returns=returns, env_timestep=env_timestep,
-                attention_masks=attention_masks, force_dropout=True,
-            )
-            epsilon = epsilon_uncond + self.condition_guidance_w * (
-                epsilon_cond - epsilon_uncond
-            )
+            epsilon = epsilon_cond
+            # epsilon_uncond = self.model(
+            #     model_input, t, returns=returns, env_timestep=env_timestep,
+            #     attention_masks=attention_masks, force_dropout=True,
+            # )
+            # epsilon = epsilon_uncond + self.condition_guidance_w * (
+            #     epsilon_cond - epsilon_uncond
+            # )
         else:
             epsilon = self.model(
                 model_input, t, env_timestep=env_timestep,
@@ -246,6 +280,7 @@ class CCDiffusion(nn.Module):
     def conditional_sample(
         self,
         cond: Dict[str, torch.Tensor],
+        obs = None,
         returns: Optional[torch.Tensor] = None,
         env_ts: Optional[torch.Tensor] = None,
         attention_masks: Optional[torch.Tensor] = None,
@@ -263,7 +298,7 @@ class CCDiffusion(nn.Module):
             if "history_trajectory" in cond:
                 trajectory_conditions = []
                 for agent_idx in range(self.n_agents):
-                    trajectory_condition = self.encode_trajectory(cond["history_trajectory"], agent_idx=agent_idx)
+                    trajectory_condition = self.encode_trajectory(cond["history_trajectory"], test_obs=obs, agent_idx=agent_idx)
                     trajectory_conditions.append(trajectory_condition)
                 trajectory_condition = torch.stack(trajectory_conditions, dim=1).view(batch_size, self.n_agents, -1)
                 batch_size = cond["history_trajectory"].shape[0]
@@ -597,7 +632,7 @@ class CCDiffusion(nn.Module):
             batch_size = obs.shape[0]
             device = obs.device
             cond = {"history_trajectory": history_trajectory}
-            actions = self.conditional_sample(cond, returns=returns, verbose=False)
+            actions = self.conditional_sample(cond, obs, returns=returns, verbose=False)
             return actions
 
     
