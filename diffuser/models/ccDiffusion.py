@@ -602,14 +602,10 @@ class CCDiffusion(nn.Module):
         total_loss = torch.tensor(0.0, device=x.device)
         info = {}
         if self.use_behavior_cloning:
-            if self.discrete_action:
-                bc_loss = self.behavioral_cloning_loss(observations, action_indices, trajectory_condition)
-            else:
-                bc_loss = self.behavioral_cloning_loss(observations, actions, trajectory_condition)
+            bc_loss = self.behavioral_cloning_loss(observations, actions, trajectory_condition)
             total_loss += self.bc_weight * bc_loss
             info["bc_loss"] = bc_loss.item() if torch.is_tensor(bc_loss) else bc_loss
 
-        
         return total_loss, info
     
     def update_target_network(self, tau: float = 0.005):

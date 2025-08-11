@@ -27,12 +27,12 @@ constants:
   update_ema_every: 1
 
   # misc
-  seed: 10013
+  seed: 10011
   job_name: "{dataset}/hh_{history_horizon}-bcw_{bc_weight}-qw_{q_weight}-pw_{policy_weight}-guidew_{condition_guidance_w}-lr_{learning_rate}-n_ddim_{n_ddim_steps}-{seed}"
   horizon: 1
   returns_scale: 380
   env_type: "mamujoco"
-  n_agents: 2
+  n_agents: 4
   use_action: True
   discrete_action: False
   decentralized_execution: True
